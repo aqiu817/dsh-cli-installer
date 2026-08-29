@@ -1,0 +1,11 @@
+# 本地构建/开发文件（不入库）
+install.ps1.template
+generate_install.ps1.py
+resource-check.py
+syntax-check.ps1
+dsh-install.cmd
+install.ps1
+test-*.ps1
+assets/
+*.pyc
+__pycache__/
