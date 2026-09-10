@@ -2335,6 +2335,38 @@ function Find-Npm([string]$nodePath) {
     return $null
 }
 
+# ---- 判断 npm 输出是否属于「可重试」错误 ----
+# 实测结论：ETARGET（上游已发版但镜像元数据尚未同步，尤其 dsh 的 60+ 个
+# @deepseek-ai/* 子包）与网络类错误都属于瞬时故障，重试即可恢复；
+# 而 ENOENT / EACCES 等是环境本身的问题，重试无意义，直接快速失败。
+function Test-NpmRetryable([string]$errCode, [string]$log) {
+    if ($errCode -in @("ETARGET", "E404", "E401", "E403", "E500", "E502", "E503",
+                       "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ESOCKETTIMEDOUT",
+                       "ENOTFOUND", "EAI_AGAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+                       "SELF_SIGNED_CERT_IN_CHAIN", "CERT_HAS_EXPIRED", "ERR_SSL_")) {
+        return $true
+    }
+    if ($log -match '429|Too Many Requests|EAI_AGAIN|socket hang up|network timeout|ECONNRESET|ENOTFOUND|npm err! code \w*E\d{3}') { return $true }
+    return $false
+}
+
+# ---- 执行一次 npm 安装，返回 @{Ok; ErrCode; Log} ----
+# 边执行边打印（保留原有的安装过程可见性），同时收集输出供重试判断使用。
+# 注意：$LASTEXITCODE 必须在原生命令结束后立即取值，后续管线会覆盖它。
+function Invoke-NpmInstall {
+    param([string]$NpmCmd, [string]$RegistryUrl)
+    $raw = & $npmCmd "install" "-g" "@deepseek-ai/dsh" "--registry=$RegistryUrl" 2>&1
+    $exitCode = $LASTEXITCODE
+    @($raw) | ForEach-Object { Write-Host ("  " + (I $_.ToString() $C.FgBrightBlack)) }
+    $text = [string]::Join("`n", @($raw | ForEach-Object { $_.ToString() }))
+    $code = ""
+    if ($text -match 'npm error code (\S+)') { $code = $Matches[1] }
+    if ($exitCode -eq 0 -and -not $code) {
+        return @{ Ok = $true;  ErrCode = "";     Log = $text }
+    }
+    return @{ Ok = $false; ErrCode = $code; Log = $text }
+}
+
 # =====================================================================
 # 主流程开始
 # =====================================================================
@@ -2509,18 +2541,45 @@ if (-not $SkipNpm) {
     # npm 会在 stderr 输出大量 warn/deprecate 信息；PS 5.1 在 $ErrorActionPreference="Stop" 下
     # 会把原生命令的 stderr 当成 NativeCommandError 抛异常。这里临时降为 Continue，
     # 让警告正常显示而不是中断安装。
+    #
+    # dsh 依赖 60+ 个 @deepseek-ai/* 子包，上游发版后镜像的元数据（packument）
+    # 同步是异步的：短时间内可能返回「版本列表已更新、部分版本仍未可解析」的状态，
+    # 表现为 ETARGET "No matching version found for ..."。这是镜像层瞬时不一致，
+    # 不是本地环境问题，因此在这里做指数退避重试；不可重试的错误立即失败。
     $oldEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
         & $npm "config" "set" "registry" $registryUrl 2>&1 | ForEach-Object { Write-Host ("  " + (I $_ $C.FgBrightBlack)) }
-        & $npm "install" "-g" "@deepseek-ai/dsh" "--registry=$registryUrl" 2>&1 | ForEach-Object { Write-Host ("  " + (I $_ $C.FgBrightBlack)) }
-        $npmExit = $LASTEXITCODE
+
+        $maxAttempts = 4
+        $last = $null
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            if ($attempt -gt 1) {
+                Box-Line (I ("重试安装（第 {0}/{1} 次）..." -f $attempt, $maxAttempts) $C.FgBrightCyan)
+            }
+            $last = Invoke-NpmInstall -NpmCmd $npm -RegistryUrl $registryUrl
+            if ($last.Ok) { break }
+
+            if (-not (Test-NpmRetryable $last.ErrCode $last.Log)) {
+                Bad ("npm 安装 dsh 失败：{0}（非瞬时错误，重试无效）" -f $last.ErrCode)
+                Warn ("如需排查可查看 npm 日志目录：{0}" -f $env:LOCALAPPDATA)
+                Read-Host "  按 Enter 退出"; exit 1
+            }
+
+            if ($attempt -lt $maxAttempts) {
+                $delay = 5 * [Math]::Pow(2, $attempt - 1)
+                Warn ("npm 报告 {0}（通常是镜像元数据尚未同步），{1} 秒后自动重试" -f $last.ErrCode, $delay)
+                Start-Sleep -Seconds $delay
+            }
+        }
+
+        if (-not $last -or -not $last.Ok) {
+            Bad ("npm 安装 dsh 失败（registry: {0}，已重试 {1} 次，最后错误: {2}）" -f $registryUrl, $maxAttempts, $last.ErrCode)
+            Warn "可尝试切换到官方源后重新运行本脚本，或稍后再试：npm 官方源同步通常更快。"
+            Read-Host "  按 Enter 退出"; exit 1
+        }
     } finally {
         $ErrorActionPreference = $oldEAP
-    }
-    if ($npmExit -ne 0) {
-        Bad "npm 安装 dsh 失败（registry: $registryUrl）"
-        Read-Host "  按 Enter 退出"; exit 1
     }
     Fine "@deepseek-ai/dsh 安装完成（registry: $registryName）"
 } else {
