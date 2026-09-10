@@ -264,6 +264,13 @@ if not defined LOCALAPPDATA set "LOCALAPPDATA=%USERPROFILE%\AppData\Local"
 set "DSH_URL=http://127.0.0.1:3080"
 set "DSH_APP_DIR=%LOCALAPPDATA%\DeepSeekHarness"
 set "EDGE_PROFILE=%DSH_APP_DIR%\EdgeProfile"
+rem dsh web prints the URL it wants opened (DSH_URL/?token=...) to stdout and
+rem regenerates the token on every start, so opening the bare DSH_URL fails with
+rem "dsh web authentication required". Redirect dsh's stdout to DSH_WEB_LOG and
+rem call :geturl to parse the real URL out of it. dsh-tray.ps1 reads the same
+rem log (same APP_DIR) when its menu items are used.
+set "DSH_WEB_LOG=%DSH_APP_DIR%\dsh-web.log"
+set "DSH_AUTH_URL=%DSH_URL%"
 
 rem Make sure Node.js and the per-user npm global bin are on PATH.
 set "PATH=%LOCALAPPDATA%\Programs\nodejs;%ProgramFiles%\nodejs;%APPDATA%\npm;%PATH%"
@@ -312,7 +319,14 @@ goto ready
     rem Launch dsh web in a COMPLETELY hidden window via PowerShell Start-Process,
     rem so no cmd window pops up on screen. Use the 8.3 short path to be safe
     rem even when the user profile path contains spaces.
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -WindowStyle Hidden -FilePath cmd.exe -ArgumentList @('/c', '%DSH_CMD_SHORT% web --no-open')"
+    rem
+    rem -RedirectStandardOutput is required here: dsh web writes the URL it wants
+    rem opened (with a ?token= that changes on every start) to stdout. Without a
+    rem capture target there is nowhere to get it from - dsh keeps the token in
+    rem memory only. A bare `cmd /c 'dsh ... > log'` form does NOT work, because
+    rem the > is quoted through PowerShell's ArgumentList and cmd never sees it.
+    if exist "%DSH_WEB_LOG%" del /q "%DSH_WEB_LOG%"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -WindowStyle Hidden -FilePath '%DSH_CMD_SHORT%' -ArgumentList @('web','--no-open') -RedirectStandardOutput '%DSH_WEB_LOG%' -PassThru | Out-Null"
     echo [DSH] Waiting for the server on %DSH_URL% ...
     for /l %%i in (1,1,90) do (
         call :check
@@ -329,10 +343,56 @@ goto ready
     exit /b 1
 
 :ready
+rem dsh web serves an auth gate: the bare DSH_URL answers 401. Prefer the URL
+rem dsh itself printed (DSH_URL/?token=...) and open THAT; fall back to the bare
+rem URL only when nothing could be captured (e.g. a server that was already
+rem running before we started, whose token is in a log we cannot see).
+set "DSH_AUTH_URL="
+call :geturl
+if defined DSH_AUTH_URL goto app
+echo [DSH] note: could not read dsh's auth URL, opening %DSH_URL% (may ask to reopen)
+set "DSH_AUTH_URL=%DSH_URL%"
+goto app
+
+:geturl
+rem Reads the auth URL out of dsh's stdout log. Leaves DSH_AUTH_URL unset when
+rem there is nothing suitable to return, so :ready can fall back to DSH_URL.
+rem
+rem Polls rather than reading once: the server binds 3080 almost immediately,
+rem but the token line goes to a redirected file and can lag the bind by a moment.
+rem Reading only once would fall back to the 401 URL on exactly that race.
+rem/goto-based flow on purpose - `for /f` inside an `if exist (...)` block is a
+rem common way to break cmd's paren matching.
+set "GURL_TRIES=0"
+goto :geturl_try
+
+:geturl_missing
+if defined DSH_AUTH_URL goto :eof
+set /a GURL_TRIES+=1
+if %GURL_TRIES% geq 15 goto :eof
+>nul 2>nul ping -n 2 127.0.0.1
+goto :geturl_try
+
+:geturl_try
+if exist "%DSH_WEB_LOG%" goto :geturl_read
+goto :geturl_missing
+
+:geturl_read
+rem The line looks like: dsh web: http://127.0.0.1:3080/?token=...
+rem so the URL is field 3.
+rem
+rem Match the 3080 URL specifically, not just "http://". A bare "http://" match
+rem would let any other http line in the log win: `for /f` runs the set once per
+rem matching line, so the LAST match overwrites the token URL and the shortcut
+rem ends up pointing at the wrong page.
+for /f "tokens=3" %%a in ('findstr /r "http://127.0.0.1:3080" "%DSH_WEB_LOG%" 2^>nul') do set "DSH_AUTH_URL=%%a"
+goto :geturl_missing
+
+:app
 rem Create an Edge app-mode shortcut so the standalone window keeps its own
 rem taskbar icon (the whale icon), then launch it.
 set "APP_LNK=%DSH_APP_DIR%\DeepSeekHarnessEdge.lnk"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=New-Object -ComObject WScript.Shell; $l=$s.CreateShortcut('%APP_LNK%'); $l.TargetPath='%EDGE%'; $l.Arguments='--app=%DSH_URL% --user-data-dir=%EDGE_PROFILE% --no-first-run --no-default-browser-check'; $l.IconLocation='%DSH_APP_DIR%\dsh.ico,0'; $l.Description='DeepSeek Harness'; $l.Save()"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=New-Object -ComObject WScript.Shell; $l=$s.CreateShortcut('%APP_LNK%'); $l.TargetPath='%EDGE%'; $l.Arguments='--app=%DSH_AUTH_URL% --user-data-dir=%EDGE_PROFILE% --no-first-run --no-default-browser-check'; $l.IconLocation='%DSH_APP_DIR%\dsh.ico,0'; $l.Description='DeepSeek Harness'; $l.Save()"
 start "" "%APP_LNK%"
 
 rem Start the hidden tray controller: it stays in the system tray and lets the
@@ -2625,11 +2685,37 @@ Add-Type -AssemblyName System.Drawing
 $DSH_URL = "http://127.0.0.1:3080"
 $APP_DIR = Join-Path $env:LOCALAPPDATA "DeepSeekHarness"
 $ICO_PATH = Join-Path $APP_DIR "dsh.ico"
+$WEB_LOG = Join-Path $APP_DIR "dsh-web.log"
+# dsh web fronts the UI with an auth gate: the bare $DSH_URL answers 401 and the
+# token is printed to stdout on every start (regenerated each time, kept in memory
+# only). So we always open the token URL captured from the log, not $DSH_URL.
+$DSH_AUTH_URL = $DSH_URL
 
 # ---------- helpers ----------
 function Test-ServerRunning {
     $c = netstat -ano | Select-String ':3080' | Select-String 'LISTENING'
     return [bool]$c
+}
+
+# Read the ?token= URL out of dsh's stdout log. Returns $null when nothing
+# suitable is there, so the caller can fall back to the bare URL.
+function Get-AuthUrl {
+    if (-not (Test-Path $WEB_LOG)) { return $null }
+    try {
+        $line = Get-Content $WEB_LOG -ErrorAction SilentlyContinue | Select-String 'http://127\.0\.0\.1:3080' | Select-Object -First 1
+        if (-not $line) { return $null }
+        $m = [regex]::Match($line.ToString(), 'https?://127\.0\.0\.1:3080[^\s"\r\n]*')
+        if ($m.Success) { return $m.Value }
+    } catch { }
+    return $null
+}
+
+# Refresh $DSH_AUTH_URL from the log. Called on every menu action so a token
+# issued by a newer server is picked up without restarting the tray.
+function Refresh-AuthUrl {
+    $u = Get-AuthUrl
+    if ($u) { $script:DSH_AUTH_URL = $u }
+    return $script:DSH_AUTH_URL
 }
 
 function Get-DshCommand {
@@ -2648,7 +2734,13 @@ function Start-DshServer {
         return
     }
     $short = (New-Object System.IO.FileInfo($dsh)).FullName
-    Start-Process -WindowStyle Hidden -FilePath "cmd.exe" -ArgumentList "/c `"$short`" web --no-open"
+    # Redirect stdout so the ?token= URL dsh prints ends up in $WEB_LOG and
+    # Open-WebUI can read it back. ArgumentList must be an ARRAY - a single
+    # "/c ... web --no-open" string passes the whole thing as one argument.
+    try {
+        if (Test-Path $WEB_LOG) { Remove-Item $WEB_LOG -Force -ErrorAction SilentlyContinue }
+    } catch { }
+    Start-Process -WindowStyle Hidden -FilePath $short -ArgumentList @('web', '--no-open') -RedirectStandardOutput $WEB_LOG
 }
 
 function Stop-DshServer {
@@ -2660,7 +2752,16 @@ function Stop-DshServer {
 }
 
 function Open-WebUI {
+    $u = Refresh-AuthUrl
+    if ($u) {
+        Start-Process $u
+        return
+    }
+    # No captured token: the server was started before this tray ran (its log is
+    # gone) or by an older dsh without the auth gate. Open the plain URL anyway -
+    # dsh's own error page tells the user to reopen the URL it printed.
     Start-Process $DSH_URL
+    $tray.ShowBalloonTip(4000, "DeepSeek Harness", "Could not read dsh's auth URL. If the page says authentication is required, use Stop Server then Start Server from this menu and open it again.", 'Warning')
 }
 
 function Update-TrayState {
